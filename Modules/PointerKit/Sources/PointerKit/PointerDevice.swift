@@ -5,12 +5,97 @@ import Foundation
 import ObservationToken
 import PointerKitC
 
+/// Runs a report request while holding the per-device request gate. The
+/// cancellation check happens after `defer` is installed, so a cancellation
+/// racing with acquisition cannot leak a permit.
+func withSynchronousReportRequestGate(
+    until shouldContinue: () -> Bool,
+    acquirePermit: () -> Bool,
+    releasePermit: () -> Void,
+    perform operation: () -> Data?
+) -> Data? {
+    while shouldContinue() {
+        guard acquirePermit() else {
+            continue
+        }
+        defer { releasePermit() }
+
+        guard shouldContinue() else {
+            return nil
+        }
+
+        return operation()
+    }
+
+    return nil
+}
+
+/// Performs one report send after a short admission check.
+///
+/// Admission is deliberately complete before `send` starts. Once admitted, the
+/// synchronous IOKit call is committed and may outlive logical invalidation;
+/// invalidation must remain free to revoke later requests without waiting for
+/// that external call to return.
+func performAdmittedSynchronousReportSend<Result>(
+    admission: () -> Bool,
+    send: () -> Result
+) -> Result? {
+    guard admission() else {
+        return nil
+    }
+    return send()
+}
+
+/// A sent HID request owns its matcher until a matching response, device
+/// invalidation, or the request deadline. Cancellation controls whether its
+/// result is returned; it cannot make a late response belong to the next
+/// request.
+func settleCommittedSynchronousReportRequest(
+    until deadline: Date,
+    shouldDeliverResult: () -> Bool,
+    isTransportValid: () -> Bool,
+    wait: (TimeInterval) -> Void,
+    response: () -> Data?
+) -> Data? {
+    while Date() < deadline {
+        if let response = response() {
+            return shouldDeliverResult() ? response : nil
+        }
+        guard isTransportValid() else {
+            return nil
+        }
+
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else {
+            break
+        }
+        wait(min(remaining, 0.01))
+    }
+
+    guard let response = response() else {
+        return nil
+    }
+    return shouldDeliverResult() ? response : nil
+}
+
 /// Common IOHID transport names.
 /// This is a shared string namespace, not an exhaustive transport model.
 public enum PointerDeviceTransportName {
     public static let usb = "USB"
     public static let bluetooth = "Bluetooth"
     public static let bluetoothLowEnergy = "Bluetooth Low Energy"
+}
+
+/// The run-loop mode used for every asynchronous `IOHIDDevice` callback.
+///
+/// AppKit switches the main run loop to its modal mode after an application
+/// returns `terminateLater`. Scheduling in the common modes keeps HID replies
+/// flowing during that bounded termination window. A single policy value is
+/// shared by scheduling and unscheduling so the two operations cannot drift.
+struct PointerDeviceRunLoopScheduling {
+    static let inputCallbacks = Self(mode: .commonModes)
+
+    let mode: CFRunLoopMode
 }
 
 public class PointerDevice {
@@ -42,7 +127,10 @@ public class PointerDevice {
     private var inputReportBuffer: UnsafeMutablePointer<UInt8>?
     private var inputReportBufferLength = 0
 
-    private let synchronousReportRequestLock = NSLock()
+    /// Serializes HID++ transactions. A request that already sent a report
+    /// retains ownership until it settles, so a late reply cannot be matched
+    /// to its successor.
+    private let synchronousReportRequestGate = DispatchSemaphore(value: 1)
     private let pendingReportRequestLock = NSLock()
     private var pendingReportMatcher: ((Data) -> Bool)?
     private var pendingReportResponse: Data?
@@ -96,7 +184,11 @@ public class PointerDevice {
             IOHIDDeviceSetInputValueMatching(device, nil)
             let this = Unmanaged.passUnretained(self).toOpaque()
             IOHIDDeviceRegisterInputValueCallback(device, Self.inputValueCallback, this)
-            IOHIDDeviceScheduleWithRunLoop(device, runLoop, CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceScheduleWithRunLoop(
+                device,
+                runLoop,
+                PointerDeviceRunLoopScheduling.inputCallbacks.mode.rawValue
+            )
         }
     }
 
@@ -117,7 +209,11 @@ public class PointerDevice {
         invalidate()
 
         if let device {
-            IOHIDDeviceUnscheduleFromRunLoop(device, runLoop, CFRunLoopMode.defaultMode.rawValue)
+            IOHIDDeviceUnscheduleFromRunLoop(
+                device,
+                runLoop,
+                PointerDeviceRunLoopScheduling.inputCallbacks.mode.rawValue
+            )
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
         }
 
@@ -477,79 +573,145 @@ extension PointerDevice {
         timeout: TimeInterval,
         matching: @escaping (Data) -> Bool
     ) -> Data? {
+        performSynchronousOutputReportRequest(
+            report,
+            timeout: timeout,
+            matching: matching
+        ) { true }
+    }
+
+    public func performSynchronousOutputReportRequest(
+        _ report: Data,
+        timeout: TimeInterval,
+        matching: @escaping (Data) -> Bool,
+        until shouldContinue: @escaping () -> Bool
+    ) -> Data? {
         guard let device, !report.isEmpty, valid else {
             return nil
         }
-
-        synchronousReportRequestLock.lock()
-        defer { synchronousReportRequestLock.unlock() }
-
-        guard ensureInputReportCallbackRegistered(minimumReportLength: max(report.count, maxInputReportSize ?? 0)),
-              valid
-        else {
-            return nil
+        let deadline = Date().addingTimeInterval(timeout)
+        let requestShouldContinue = {
+            shouldContinue() && Date() < deadline
         }
 
-        let semaphore = DispatchSemaphore(value: 0)
-        pendingReportRequestLock.lock()
-        clearPendingReportRequest()
-        pendingReportMatcher = matching
-        pendingReportSemaphore = semaphore
-        pendingReportRequestLock.unlock()
-
-        let result = report.withUnsafeBytes { rawBuffer -> IOReturn in
-            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
-                return kIOReturnBadArgument
+        return withSynchronousReportRequestGate(
+            until: requestShouldContinue,
+            acquirePermit: {
+                self.acquireSynchronousReportRequestPermit()
+            },
+            releasePermit: {
+                self.synchronousReportRequestGate.signal()
+            }
+        ) {
+            guard requestShouldContinue() else {
+                return nil
+            }
+            guard ensureInputReportCallbackRegistered(minimumReportLength: max(report.count, maxInputReportSize ?? 0)),
+                  valid
+            else {
+                return nil
             }
 
-            stateLock.lock()
-            defer { stateLock.unlock() }
-            guard isValid else {
-                return kIOReturnNotOpen
-            }
-
-            return IOHIDDeviceSetReport(
-                device,
-                kIOHIDReportTypeOutput,
-                CFIndex(report[0]),
-                baseAddress,
-                report.count
-            )
-        }
-
-        guard result == kIOReturnSuccess else {
+            let semaphore = DispatchSemaphore(value: 0)
             pendingReportRequestLock.lock()
             clearPendingReportRequest()
+            pendingReportMatcher = matching
+            pendingReportSemaphore = semaphore
             pendingReportRequestLock.unlock()
-            return nil
-        }
 
-        if Thread.isMainThread {
-            let deadline = Date().addingTimeInterval(timeout)
-            while Date() < deadline {
-                pendingReportRequestLock.lock()
-                let response = pendingReportResponse
-                pendingReportRequestLock.unlock()
-
-                if response != nil {
-                    break
+            let result = report.withUnsafeBytes { rawBuffer -> IOReturn in
+                guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else {
+                    return kIOReturnBadArgument
                 }
 
-                // Pump the run loop that owns IOHIDDevice; sleep would block the input-report callback.
-                let result = CFRunLoopRunInMode(.defaultMode, 0.01, true)
-                if result == .finished {
-                    break
+                guard requestShouldContinue() else {
+                    return kIOReturnNotOpen
+                }
+
+                return performAdmittedSynchronousReportSend(
+                    admission: {
+                        self.stateLock.withLock { self.isValid }
+                            && requestShouldContinue()
+                    },
+                    send: {
+                        IOHIDDeviceSetReport(
+                            device,
+                            kIOHIDReportTypeOutput,
+                            CFIndex(report[0]),
+                            baseAddress,
+                            report.count
+                        )
+                    }
+                ) ?? kIOReturnNotOpen
+            }
+
+            guard result == kIOReturnSuccess else {
+                pendingReportRequestLock.lock()
+                clearPendingReportRequest()
+                pendingReportRequestLock.unlock()
+                return nil
+            }
+
+            let waitForResponse: (TimeInterval) -> Void
+            if CFEqual(CFRunLoopGetCurrent(), runLoop) {
+                waitForResponse = { interval in
+                    _ = CFRunLoopRunInMode(.defaultMode, interval, true)
+                }
+            } else {
+                waitForResponse = { interval in
+                    _ = semaphore.wait(timeout: .now() + interval)
                 }
             }
-        } else {
-            _ = semaphore.wait(timeout: .now() + timeout)
+
+            defer {
+                pendingReportRequestLock.lock()
+                clearPendingReportRequest()
+                pendingReportRequestLock.unlock()
+            }
+            return settleCommittedSynchronousReportRequest(
+                until: deadline,
+                shouldDeliverResult: {
+                    requestShouldContinue() && self.valid
+                },
+                isTransportValid: { self.valid },
+                wait: waitForResponse
+            ) {
+                self.pendingReportRequestLock.lock()
+                let response = self.pendingReportResponse
+                self.pendingReportRequestLock.unlock()
+                return response
+            }
+        }
+    }
+
+    private func acquireSynchronousReportRequestPermit() -> Bool {
+        if synchronousReportRequestGate.wait(timeout: .now()) == .success {
+            return true
         }
 
-        pendingReportRequestLock.lock()
-        let response = pendingReportResponse
-        clearPendingReportRequest()
-        pendingReportRequestLock.unlock()
-        return response
+        if CFEqual(CFRunLoopGetCurrent(), runLoop) {
+            // A background request can hold the gate while waiting for an
+            // input-report callback on this run loop. Process one turn before
+            // retrying instead of blocking the callback that releases it.
+            _ = CFRunLoopRunInMode(.defaultMode, 0.01, true)
+            return false
+        }
+
+        return synchronousReportRequestGate.wait(timeout: .now() + 0.01) == .success
+    }
+
+    public func performSynchronousOutputReportRequestOnce(
+        _ report: Data,
+        timeout: TimeInterval,
+        matching: @escaping (Data) -> Bool,
+        until shouldContinue: @escaping () -> Bool
+    ) -> Data? {
+        performSynchronousOutputReportRequest(
+            report,
+            timeout: timeout,
+            matching: matching,
+            until: shouldContinue
+        )
     }
 
     public func observeReport(using closure: @escaping InputReportClosure) -> ObservationToken {
