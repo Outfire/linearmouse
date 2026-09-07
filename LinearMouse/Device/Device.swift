@@ -4,14 +4,33 @@
 import Combine
 import Defaults
 import Foundation
+import HIDPP
 import ObservationToken
 import os.log
 import PointerKit
+
+/// Keep HID++ cancellation at the app boundary so PointerKit remains a
+/// transport-agnostic package. This lets an in-flight direct-device request
+/// yield before lifecycle teardown performs its main-run-loop restore.
+extension PointerDevice: HIDPPCancellableDeviceIO {}
+
+enum PointerLinearScalingRestoreOperation {
+    static func perform(
+        baseline: Int?,
+        write: (Int) -> Void
+    ) {
+        guard let baseline else {
+            return
+        }
+        write(baseline)
+    }
+}
 
 class Device {
     private static let log = OSLog(
         subsystem: Bundle.main.bundleIdentifier!, category: "Device"
     )
+    static let logitechOrdinaryReadTimeout: TimeInterval = 1
 
     static let fallbackPointerAcceleration = 0.6875
     static let fallbackPointerResolution = 400.0
@@ -35,40 +54,125 @@ class Device {
     private weak var manager: DeviceManager?
     private var inputReportHandlers: [InputReportHandler] = []
     private var logitechReprogrammableControlsMonitor: LogitechReprogrammableControlsMonitor?
-    private var cachedLogitechDPIController: LogitechHIDPPDeviceDPIController?
-    private var cachedLogitechHighResolutionWheelController: LogitechHIDPPHighResolutionWheelController?
-    var logitechDPIController: LogitechHIDPPDeviceDPIController? {
-        if let cachedLogitechDPIController {
-            return cachedLogitechDPIController
-        }
+    lazy var logitechSession = LogitechDeviceSession(deviceID: id)
 
-        guard let controller = LogitechHIDPPDeviceDPIController(device: device) else {
-            return nil
-        }
-
-        cachedLogitechDPIController = controller
-        return controller
+    func logitechAdjustableDPI(
+        for token: CancellationToken,
+        deadline: Date? = nil,
+        loadsSupportedDPI: Bool = true,
+        until operationShouldContinue: @escaping () -> Bool = { true }
+    ) -> LogitechDeviceSession.FeatureAccess<AdjustableDPI>? {
+        logitechAdjustableDPI(
+            expectedToken: token,
+            requestDeadline: deadline,
+            loadsSupportedDPI: loadsSupportedDPI,
+            operationShouldContinue: operationShouldContinue
+        )
     }
 
-    func invalidateLogitechDPIController() {
-        cachedLogitechDPIController = nil
+    func logitechAdjustableDPI(
+        expectedToken: CancellationToken?,
+        requestDeadline: Date? = nil,
+        loadsSupportedDPI: Bool = true,
+        operationShouldContinue: @escaping () -> Bool = { true }
+    ) -> LogitechDeviceSession.FeatureAccess<AdjustableDPI>? {
+        logitechSession.adjustableDPI(expectedToken: expectedToken) { [weak self] route, token in
+            guard let self else {
+                return nil
+            }
+
+            let transportShouldContinue = { [weak self] in
+                token.shouldContinue
+                    && self?.isRemoved == false
+            }
+            guard let target = LogitechHIDPPFeatureTargetResolver.resolve(
+                .adjustableDPI,
+                for: device,
+                receiverSlot: route?.slot ?? logitechSession.dpiReceiverSlotSnapshot,
+                requestDeadline: requestDeadline,
+                requestShouldContinue: operationShouldContinue,
+                shouldContinue: transportShouldContinue
+            ) else {
+                return nil
+            }
+            let feature: AdjustableDPI
+            if loadsSupportedDPI {
+                guard let completeFeature = AdjustableDPI(
+                    transport: target.transport,
+                    featureIndex: target.featureIndex,
+                    deadline: requestDeadline,
+                    until: operationShouldContinue
+                ) else {
+                    return nil
+                }
+                feature = completeFeature
+            } else {
+                feature = AdjustableDPI(
+                    transport: target.transport,
+                    featureIndex: target.featureIndex,
+                    supportedDPI: []
+                )
+            }
+            return .init(
+                feature: feature,
+                stableTargetKey: logitechHardwareTargetKey(
+                    for: route,
+                    receiverSlot: feature.receiverSlot
+                ),
+                receiverSlot: feature.receiverSlot
+            )
+        }
     }
 
-    var logitechHighResolutionWheelController: LogitechHIDPPHighResolutionWheelController? {
-        if let cachedLogitechHighResolutionWheelController {
-            return cachedLogitechHighResolutionWheelController
-        }
-
-        guard let controller = LogitechHIDPPHighResolutionWheelController(device: device) else {
-            return nil
-        }
-
-        cachedLogitechHighResolutionWheelController = controller
-        return controller
+    func logitechHiResWheel(
+        for token: CancellationToken,
+        deadline: Date? = nil,
+        until operationShouldContinue: @escaping () -> Bool = { true }
+    ) -> LogitechDeviceSession.FeatureAccess<HiResWheel>? {
+        logitechHiResWheel(
+            expectedToken: token,
+            requestDeadline: deadline,
+            operationShouldContinue: operationShouldContinue
+        )
     }
 
-    func invalidateLogitechHighResolutionWheelController() {
-        cachedLogitechHighResolutionWheelController = nil
+    func logitechHiResWheel(
+        expectedToken: CancellationToken?,
+        requestDeadline: Date? = nil,
+        operationShouldContinue: @escaping () -> Bool = { true }
+    ) -> LogitechDeviceSession.FeatureAccess<HiResWheel>? {
+        logitechSession.hiResWheel(expectedToken: expectedToken) { [weak self] route, token in
+            guard let self else {
+                return nil
+            }
+
+            let transportShouldContinue = { [weak self] in
+                token.shouldContinue
+                    && self?.isRemoved == false
+            }
+            guard let target = LogitechHIDPPFeatureTargetResolver.resolve(
+                .hiresWheel,
+                for: device,
+                receiverSlot: route?.slot ?? logitechSession.hiResWheelReceiverSlotSnapshot,
+                requestDeadline: requestDeadline,
+                requestShouldContinue: operationShouldContinue,
+                shouldContinue: transportShouldContinue
+            ) else {
+                return nil
+            }
+            let feature = HiResWheel(
+                transport: target.transport,
+                featureIndex: target.featureIndex
+            )
+            return .init(
+                feature: feature,
+                stableTargetKey: logitechHardwareTargetKey(
+                    for: route,
+                    receiverSlot: feature.receiverSlot
+                ),
+                receiverSlot: feature.receiverSlot
+            )
+        }
     }
 
     private var logitechControlsMonitorSubscriptions = Set<AnyCancellable>()
@@ -79,31 +183,84 @@ class Device {
     }
 
     private var removed = false
+    private let removalLock = NSLock()
 
     private var verbosedLoggingOn = Defaults[.verbosedLoggingOn]
 
     private let initialPointerResolution: Double
-    let hardwareDPILock = NSLock()
-    lazy var hardwareDPIQueue = DispatchQueue(
-        label: "app.linearmouse.hardware-dpi.\(id)",
-        qos: .default
-    )
-    var cachedHardwareDPI: Int?
-    var hardwareDPIApplyRequestID = UUID()
-    let highResolutionWheelLock = NSLock()
-    lazy var highResolutionWheelQueue = DispatchQueue(
-        label: "app.linearmouse.high-resolution-wheel.\(id)",
-        qos: .default
-    )
-    var cachedHighResolutionWheelEnabled: Bool?
-    var cachedHighResolutionWheelMultiplier: Int?
-    var initialHighResolutionWheelEnabled: Bool?
-    var highResolutionWheelApplyRequestID = UUID()
+    private let initialUseLinearScalingMouseAcceleration: Int?
+    lazy var logitechSettingsReconciler = LogitechDeviceSettingsReconciler(device: self)
+
+    var logitechReceiverRouteSnapshot: LogitechReceiverRoute? {
+        logitechSession.discoverySnapshot?.route
+    }
+
+    var logitechReceiverDiscoverySnapshot: LogitechReceiverDiscovery? {
+        logitechSession.discoverySnapshot
+    }
+
+    func logitechHardwareTargetKey(receiverSlot: UInt8? = nil) -> LogitechHardwareTargetKey? {
+        logitechHardwareTargetKey(for: logitechReceiverRouteSnapshot, receiverSlot: receiverSlot)
+    }
+
+    func logitechHardwareTargetKey(
+        for route: LogitechReceiverRoute?,
+        receiverSlot: UInt8? = nil
+    ) -> LogitechHardwareTargetKey? {
+        if let route {
+            guard receiverSlot == nil || receiverSlot == route.slot else {
+                return nil
+            }
+            return .receiver(
+                vendorID: vendorID,
+                receiverLocationID: pointerDevice.locationID,
+                identity: route.identity
+            )
+        }
+
+        guard !LogitechReceiverRouteResolver.requiresDiscovery(for: pointerDevice) else {
+            return nil
+        }
+        if let receiverSlot {
+            // On-demand legacy routing supplies a slot but no stable logical
+            // identity. Never transfer a process baseline by slot alone.
+            _ = receiverSlot
+            return nil
+        }
+        return .direct(
+            transport: pointerDevice.transport,
+            locationID: pointerDevice.locationID,
+            vendorID: vendorID,
+            productID: productID,
+            serialNumber: serialNumber,
+            name: productName ?? name
+        )
+    }
+
+    var logitechHardwareBaselineStore: LogitechHardwareBaselineStore? {
+        manager?.logitechHardwareBaselineStore
+    }
+
+    @discardableResult
+    func updateLogitechReceiverDiscovery(
+        _ discovery: LogitechReceiverDiscovery?
+    ) -> LogitechDeviceSession.DiscoveryUpdate {
+        let update = logitechSession.updateDiscovery(discovery)
+        promoteSensorDPIBaselineIfPossible()
+        promoteHiResWheelBaselineIfPossible()
+        if update.hardwareTargetChanged {
+            logitechReprogrammableControlsMonitor?.invalidateTarget()
+        }
+        if !update.hardwareTargetChanged,
+           update.candidateAvailabilityChanged,
+           !update.hasCandidates {
+            updateLogitechControlsMonitorRunning()
+        }
+        return update
+    }
 
     var isRemoved: Bool {
-        hardwareDPILock.lock()
-        defer { hardwareDPILock.unlock() }
-        return removed
+        removalLock.withLock { removed }
     }
 
     private var inputObservationToken: ObservationToken?
@@ -133,6 +290,7 @@ class Device {
 
         initialPointerResolution =
             device.pointerResolution ?? Self.fallbackPointerResolution
+        initialUseLinearScalingMouseAcceleration = device.useLinearScalingMouseAcceleration
 
         // TODO: More elegant way?
         inputObservationToken = device.observeInput { [weak self] in
@@ -160,7 +318,6 @@ class Device {
             let monitor = LogitechReprogrammableControlsMonitor(device: self)
             logitechReprogrammableControlsMonitor = monitor
             observeLogitechControlsMonitorDemand()
-            updateLogitechControlsMonitorRunning()
         }
 
         os_log(
@@ -184,21 +341,16 @@ class Device {
     }
 
     func markRemoved() {
-        hardwareDPILock.lock()
-        removed = true
-        cachedHardwareDPI = nil
-        hardwareDPIApplyRequestID = UUID()
-        hardwareDPILock.unlock()
-        invalidateLogitechHighResolutionWheelController()
-        highResolutionWheelLock.lock()
-        cachedHighResolutionWheelEnabled = nil
-        cachedHighResolutionWheelMultiplier = nil
-        initialHighResolutionWheelEnabled = nil
-        highResolutionWheelLock.unlock()
+        releaseSyntheticInputReportButtons()
+        removalLock.withLock { removed = true }
+        logitechSession.cancelAll()
 
         inputObservationToken = nil
         reportObservationToken = nil
-        logitechReprogrammableControlsMonitor?.disable()
+        // The PointerDevice has already been invalidated by this point. Any
+        // reporting cleanup must have completed through DeviceManager's async
+        // stop path; do not re-enable teardown I/O during sleep or removal.
+        logitechReprogrammableControlsMonitor?.abandon()
         logitechReprogrammableControlsMonitor = nil
         logitechControlsMonitorSubscriptions.removeAll()
     }
@@ -216,13 +368,176 @@ class Device {
         logitechReprogrammableControlsMonitor != nil
     }
 
+    private var allowsDeviceWork: Bool {
+        manager?.allowsDeviceWork == true
+    }
+
+    /// Stops control monitoring and best-effort restores reporting before the
+    /// app's event pipeline is suspended for system sleep.
+    func stopLogitechControlsMonitoringForSleep(
+        authorization: CancellationToken,
+        deadline: Date,
+        completion: @escaping () -> Void
+    ) {
+        logitechControlsMonitorSubscriptions.removeAll()
+        guard let logitechReprogrammableControlsMonitor else {
+            DispatchQueue.main.async(execute: completion)
+            return
+        }
+
+        logitechReprogrammableControlsMonitor.stopForSleep(
+            authorization: authorization,
+            deadline: deadline,
+            completion: completion
+        )
+    }
+
+    /// Reconnects the device-level demand observers after a sleep stop. A fast
+    /// wake may arrive while the reporting restore worker is still draining;
+    /// the monitor coalesces that wake and reconciles demand once its cleanup
+    /// barrier has released.
+    func resumeLogitechControlsAfterSleep() {
+        guard !isRemoved,
+              allowsDeviceWork,
+              let logitechReprogrammableControlsMonitor
+        else {
+            return
+        }
+
+        observeLogitechControlsMonitorDemand()
+        logitechReprogrammableControlsMonitor.resumeAfterSleep { [weak self] in
+            self?.updateLogitechControlsMonitorRunning()
+        }
+    }
+
+    /// Final device teardown must not attempt HID++ I/O through an invalidated
+    /// transport.
+    func abandonLogitechControlsMonitoring() {
+        logitechControlsMonitorSubscriptions.removeAll()
+        logitechReprogrammableControlsMonitor?.abandon()
+    }
+
+    func releaseSyntheticInputReportButtons() {
+        guard lastButtonStates != 0 else {
+            return
+        }
+
+        let context = InputReportContext(report: Data(), lastButtonStates: lastButtonStates)
+        inputReportHandlers.forEach { $0.releasePressedButtons(context) }
+        lastButtonStates = 0
+    }
+
+    /// Restores a persisted Logitech controls baseline even when normal
+    /// mapping demand no longer keeps the monitor running.
+    func restorePendingLogitechControlsForTeardown(
+        authorization: CancellationToken,
+        deadline: Date,
+        completion: @escaping () -> Void
+    ) {
+        guard let logitechReprogrammableControlsMonitor else {
+            DispatchQueue.main.async(execute: completion)
+            return
+        }
+
+        logitechReprogrammableControlsMonitor.restorePendingForTeardown(
+            authorization: authorization,
+            deadline: deadline,
+            completion: completion
+        )
+    }
+
+    /// Restores DPI and Hi-Res Wheel on the existing Logitech session queue.
+    /// Normal apply/retry work is frozen first; completion never depends on a
+    /// main-thread HID wait and is safe to race with the outer hard deadline.
+    func restoreLogitechSettingsForTeardown(
+        deadline: Date,
+        until operationShouldContinue: @escaping () -> Bool,
+        completion: @escaping (_ restored: Bool) -> Void
+    ) {
+        let deliver: (Bool) -> Void = { restored in
+            DispatchQueue.main.async {
+                completion(restored)
+            }
+        }
+
+        logitechSession.runTerminalHardwareRestore { [weak self] dpiToken, wheelToken, ownsTerminalRestore in
+            guard let self else {
+                deliver(false)
+                return
+            }
+
+            let restored = LogitechTerminalHardwareRestoreRetry.perform(
+                operations: [
+                    .init(
+                        shouldContinue: {
+                            dpiToken.shouldContinue
+                                && operationShouldContinue()
+                                && ownsTerminalRestore()
+                        },
+                        attempt: { attempt in
+                            self.restoreSensorDPIForTeardown(
+                                expectedToken: dpiToken,
+                                attempt: attempt
+                            )
+                        }
+                    ),
+                    .init(
+                        shouldContinue: {
+                            wheelToken.shouldContinue
+                                && operationShouldContinue()
+                                && ownsTerminalRestore()
+                        },
+                        attempt: { attempt in
+                            self.restoreHighResolutionWheelForTeardown(
+                                expectedToken: wheelToken,
+                                attempt: attempt
+                            )
+                        }
+                    )
+                ],
+                deadline: deadline,
+                wait: Thread.sleep(forTimeInterval:)
+            )
+            deliver(restored)
+        } onCancelled: {
+            deliver(false)
+        }
+    }
+
+    /// Closes every normal Logitech writer before receiver readiness or target
+    /// validation begins. The monitor/session objects keep their baselines and
+    /// can later perform the terminal restore through the verified route.
+    func freezeLogitechForTerminalTeardown() {
+        abandonLogitechControlsMonitoring()
+        logitechSession.freezeTerminalHardwareMutations()
+    }
+
+    /// Revokes every outstanding Logitech teardown owner. Late callbacks are
+    /// harmless because the manager's bounded request is already one-shot.
+    func cancelLogitechTeardown() {
+        abandonLogitechControlsMonitoring()
+        prepareSensorDPIForReconnect()
+        prepareHighResolutionWheelForReconnect()
+    }
+
     func requestLogitechControlsForcedReconfiguration() {
-        updateLogitechControlsMonitorRunning()
-        logitechReprogrammableControlsMonitor?.requestForcedReconfiguration()
+        logitechSession.perform { [weak self] in
+            DispatchQueue.main.async {
+                guard let self, !self.isRemoved, self.allowsDeviceWork else {
+                    return
+                }
+
+                self.updateLogitechControlsMonitorRunning()
+                self.logitechReprogrammableControlsMonitor?.requestForcedReconfiguration()
+            }
+        }
     }
 
     func prepareLogitechControlsRecording() {
-        guard let logitechReprogrammableControlsMonitor else {
+        guard allowsDeviceWork,
+              logitechSession.allowsOrdinaryHardwareIO,
+              let logitechReprogrammableControlsMonitor
+        else {
             return
         }
 
@@ -231,6 +546,10 @@ class Device {
     }
 
     private func observeLogitechControlsMonitorDemand() {
+        guard logitechControlsMonitorSubscriptions.isEmpty else {
+            return
+        }
+
         ConfigurationState.shared
             .$configuration
             .dropFirst()
@@ -251,7 +570,9 @@ class Device {
     }
 
     private func updateLogitechControlsMonitorRunning() {
-        guard !isRemoved else {
+        guard !isRemoved,
+              allowsDeviceWork,
+              logitechSession.allowsOrdinaryHardwareIO else {
             return
         }
 
@@ -259,7 +580,12 @@ class Device {
             return
         }
 
-        if LogitechReprogrammableControlsMonitor.isNeeded(for: self) {
+        let receiverDiscovery = logitechReceiverDiscoverySnapshot
+        let waitingForReceiverDiscovery = LogitechReceiverRouteResolver.requiresDiscovery(for: pointerDevice)
+            && (receiverDiscovery?.identities.isEmpty != false)
+        let needsRestoreWorker = logitechReprogrammableControlsMonitor.needsRestoreWorkerForCurrentTarget()
+        if LogitechReprogrammableControlsMonitor.isNeeded(for: self) || needsRestoreWorker,
+           !waitingForReceiverDiscovery {
             logitechReprogrammableControlsMonitor.enable()
         } else {
             logitechReprogrammableControlsMonitor.disable()
@@ -409,11 +735,29 @@ extension Device {
         device.pointerResolution = initialPointerResolution
     }
 
+    /// Restore only software pointer properties. UI-level pointer-speed reset
+    /// must not cancel hardware work that remains configured for the device.
     func restorePointerAccelerationAndPointerSpeed() {
-        restoreHardwareDPI()
-        restoreHighResolutionWheel()
         restorePointerSpeed()
         restorePointerAcceleration()
+    }
+
+    private func restoreUseLinearScalingMouseAcceleration() {
+        PointerLinearScalingRestoreOperation.perform(
+            baseline: initialUseLinearScalingMouseAcceleration
+        ) { baseline in
+            device.useLinearScalingMouseAcceleration = baseline
+        }
+    }
+
+    /// Clears lifecycle-scoped Logitech access after the asynchronous hardware
+    /// barrier, then restores the software pointer properties. No HID++ I/O is
+    /// performed from this main-thread method.
+    func finishLifecycleTeardown() {
+        prepareSensorDPIForReconnect()
+        prepareHighResolutionWheelForReconnect()
+        restorePointerAccelerationAndPointerSpeed()
+        restoreUseLinearScalingMouseAcceleration()
     }
 
     private func inputValueCallback(
@@ -466,6 +810,10 @@ extension Device {
     }
 
     private func inputReportCallback(_ device: PointerDevice, _ report: Data) {
+        guard allowsDeviceWork else {
+            return
+        }
+
         if verbosedLoggingOn {
             let reportHex = report.map { String(format: "%02X", $0) }.joined(separator: " ")
             os_log(

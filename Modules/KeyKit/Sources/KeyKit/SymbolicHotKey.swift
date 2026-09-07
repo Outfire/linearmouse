@@ -2,6 +2,7 @@
 // Copyright (c) 2021-2026 LinearMouse
 
 import CoreFoundation
+import CoreGraphics
 import KeyKitC
 
 public enum SymbolicHotKey: UInt32 {
@@ -124,15 +125,15 @@ public func postSymbolicHotKey(_ hotkey: SymbolicHotKey) throws {
     var accumulated = CGEventFlags()
     for (flag, keyCode) in activeModifiers {
         accumulated.insert(flag)
-        let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true)!
+        let event = CGEvent.makeHardwareLikeKeyEvent(virtualKey: keyCode, keyDown: true)!
         event.type = .flagsChanged
         event.flags = accumulated
         event.post(tap: .cgSessionEventTap)
     }
 
-    let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: virtualKeyCode, keyDown: true)!
+    let keyDown = CGEvent.makeHardwareLikeKeyEvent(virtualKey: virtualKeyCode, keyDown: true)!
     keyDown.flags = flags
-    let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: virtualKeyCode, keyDown: false)!
+    let keyUp = CGEvent.makeHardwareLikeKeyEvent(virtualKey: virtualKeyCode, keyDown: false)!
     keyUp.flags = flags
 
     keyDown.post(tap: .cgSessionEventTap)
@@ -140,7 +141,7 @@ public func postSymbolicHotKey(_ hotkey: SymbolicHotKey) throws {
 
     for (flag, keyCode) in activeModifiers.reversed() {
         accumulated.remove(flag)
-        let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)!
+        let event = CGEvent.makeHardwareLikeKeyEvent(virtualKey: keyCode, keyDown: false)!
         event.type = .flagsChanged
         event.flags = accumulated
         event.post(tap: .cgSessionEventTap)

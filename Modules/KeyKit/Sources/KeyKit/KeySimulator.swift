@@ -114,7 +114,7 @@ public class KeySimulator: KeySimulating {
             throw KeySimulatorError.unsupportedKey
         }
 
-        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: keyDown) else {
+        guard let event = CGEvent.makeHardwareLikeKeyEvent(virtualKey: keyCode, keyDown: keyDown) else {
             return
         }
 
@@ -202,7 +202,7 @@ public class KeySimulator: KeySimulating {
             return
         }
 
-        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true) else {
+        guard let event = CGEvent.makeHardwareLikeKeyEvent(virtualKey: keyCode, keyDown: true) else {
             return
         }
 
