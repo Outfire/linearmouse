@@ -240,7 +240,7 @@ extension [Scheme] {
         }
     }
 
-    enum SchemeIndex {
+    enum SchemeIndex: Equatable {
         case at(Int)
         case insertAt(Int)
     }

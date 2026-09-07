@@ -119,58 +119,69 @@ final class ConfigurationTests: XCTestCase {
         matcher.vendorID = 1
         matcher.productID = 2
 
+        // The device-only scheme comes last so that a lookup without app conditions
+        // has to skip the processName and processPath schemes to reach it.
         let schemes = [
-            Scheme(if: [.init(device: matcher)]),
             Scheme(if: [.init(device: matcher, processName: "Foo.exe")]),
-            Scheme(if: [.init(device: matcher, processPath: "/tmp/Foo.exe")])
+            Scheme(if: [.init(device: matcher, processPath: "/tmp/Foo.exe")]),
+            Scheme(if: [.init(device: matcher)])
         ]
 
-        guard case let .at(nameIndex) = schemes.schemeIndex(
-            ofDeviceMatcher: matcher,
-            ofApp: nil,
-            ofProcessPath: nil,
-            ofProcessName: "Foo.exe",
-            ofDisplay: nil
-        ) else {
-            XCTFail("Expected to find the processName scheme")
-            return
-        }
-        XCTAssertEqual(nameIndex, 1)
+        XCTAssertEqual(
+            schemes.schemeIndex(
+                ofDeviceMatcher: matcher,
+                ofApp: nil,
+                ofProcessPath: nil,
+                ofProcessName: "Foo.exe",
+                ofDisplay: nil
+            ),
+            .at(0)
+        )
+        XCTAssertEqual(
+            schemes.schemeIndex(
+                ofDeviceMatcher: matcher,
+                ofApp: nil,
+                ofProcessPath: "/tmp/Foo.exe",
+                ofProcessName: nil,
+                ofDisplay: nil
+            ),
+            .at(1)
+        )
+        XCTAssertEqual(
+            schemes.schemeIndex(
+                ofDeviceMatcher: matcher,
+                ofApp: nil,
+                ofProcessPath: nil,
+                ofProcessName: nil,
+                ofDisplay: nil
+            ),
+            .at(2)
+        )
+        XCTAssertEqual(
+            schemes.schemeIndex(
+                ofDeviceMatcher: matcher,
+                ofApp: nil,
+                ofProcessPath: nil,
+                ofProcessName: "Bar.exe",
+                ofDisplay: nil
+            ),
+            .insertAt(3)
+        )
 
-        guard case let .at(pathIndex) = schemes.schemeIndex(
-            ofDeviceMatcher: matcher,
-            ofApp: nil,
-            ofProcessPath: "/tmp/Foo.exe",
-            ofProcessName: nil,
-            ofDisplay: nil
-        ) else {
-            XCTFail("Expected to find the processPath scheme")
-            return
-        }
-        XCTAssertEqual(pathIndex, 2)
-
-        guard case let .at(deviceIndex) = schemes.schemeIndex(
-            ofDeviceMatcher: matcher,
-            ofApp: nil,
-            ofProcessPath: nil,
-            ofProcessName: nil,
-            ofDisplay: nil
-        ) else {
-            XCTFail("Expected to find the device scheme")
-            return
-        }
-        XCTAssertEqual(deviceIndex, 0)
-
-        guard case .insertAt = schemes.schemeIndex(
-            ofDeviceMatcher: matcher,
-            ofApp: nil,
-            ofProcessPath: nil,
-            ofProcessName: "Bar.exe",
-            ofDisplay: nil
-        ) else {
-            XCTFail("Expected an insertion index for an unknown process name")
-            return
-        }
+        // A processName scheme alone must not satisfy a lookup without app conditions.
+        let processNameOnlySchemes = [
+            Scheme(if: [.init(device: matcher, processName: "Foo.exe")])
+        ]
+        XCTAssertEqual(
+            processNameOnlySchemes.schemeIndex(
+                ofDeviceMatcher: matcher,
+                ofApp: nil,
+                ofProcessPath: nil,
+                ofProcessName: nil,
+                ofDisplay: nil
+            ),
+            .insertAt(0)
+        )
     }
 
     func testMergeAutoScroll() {

@@ -52,12 +52,7 @@ class AppPickerState: ObservableObject {
     }
 
     private var configuredExecutableNameSet: Set<String> {
-        Set(schemeState.targetSpecificSchemes.reduce([String]()) { acc, element in
-            guard let processName = element.element.if?.first?.processName else {
-                return acc
-            }
-            return acc + [processName]
-        })
+        Set(schemeState.targetSpecificSchemes.compactMap { $0.element.if?.first?.processName })
     }
 
     var configuredExecutableNames: [String] {
