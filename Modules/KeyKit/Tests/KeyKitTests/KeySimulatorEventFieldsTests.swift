@@ -16,7 +16,9 @@ final class KeySimulatorEventFieldsTests: XCTestCase {
             recordedEvents.append(event)
         }
 
+        let before = DispatchTime.now().uptimeNanoseconds
         try simulator.press(keys: [.f1], tap: nil)
+        let after = DispatchTime.now().uptimeNanoseconds
 
         XCTAssertEqual(recordedEvents.map(\.type), [.keyDown, .keyUp])
         for event in recordedEvents {
@@ -24,7 +26,8 @@ final class KeySimulatorEventFieldsTests: XCTestCase {
                 event.getIntegerValueField(.eventSourceStateID),
                 Int64(CGEventSourceStateID.hidSystemState.rawValue)
             )
-            XCTAssertNotEqual(event.timestamp, 0)
+            XCTAssertGreaterThanOrEqual(event.timestamp, before)
+            XCTAssertLessThanOrEqual(event.timestamp, after)
             XCTAssertEqual(
                 event.getIntegerValueField(.keyboardEventKeyboardType),
                 Int64(LMGetKbdType())
